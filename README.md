@@ -8,7 +8,7 @@ Contiene la solución completa del laboratorio, guardada **paso por paso**: cada
 
 ## El caso
 
-Una empresa de telecomunicaciones pierde clientes, y el área de Retención solo puede llamar a unos pocos cada semana. Hoy los elige a ojo. La meta del curso es que, cada lunes, Retención reciba una lista priorizada de clientes en riesgo, con datos confiables y un modelo en producción.
+Una empresa de telecomunicaciones pierde clientes, y el área de Retención solo puede llamar a unos pocos cada semana. Hoy los elige al azar. El objetivo es que, cada lunes, Retención reciba una lista priorizada de clientes en riesgo, con datos confiables y un modelo en producción.
 
 La Unidad 3 responde la primera pregunta: **¿podemos confiar en lo que sabemos de cada cliente?** El resultado es un perfil del cliente en BigQuery, que es el punto de partida de las unidades 4 a 8.
 
@@ -79,8 +79,6 @@ git status -s
 Luego corres lo que indica la guía y haces **tu propio commit** en tu repositorio. Tus commits tendrán otros hashes, aunque el contenido sea el mismo: el hash depende también del autor, la fecha y el commit anterior.
 
 ### Mapa de commits
-
-Se lee de abajo hacia arriba en `git log`; aquí va en orden de uso.
 
 | Paso | Hash | Qué traer | Resultado esperado |
 |---|---|---|---|
