@@ -1,0 +1,15 @@
+# Dependencias fijas para el entorno de pruebas (Python 3.12 + Java 17)
+# pyspark: motor de procesamiento distribuido que estamos probando
+pyspark==3.5.3
+# pytest: framework de tests que ejecuta y organiza las pruebas
+pytest==9.1.1
+# setuptools: pyspark.testing importa "distutils", eliminado del stdlib en Python 3.12
+setuptools==84.0.0
+# pandas: pyspark.testing lo importa internamente aunque solo comparemos DataFrames de Spark
+pandas==2.3.3
+# pyarrow: pyspark.testing lo importa internamente aunque solo comparemos DataFrames de Spark
+pyarrow==25.0.1
+# numpy<2: pyspark 3.5.3 usa "np.NaN", eliminado en numpy 2
+numpy==1.26.4
+
+# Nota: Java 17 no se instala con pip; debe estar en el sistema (JAVA_HOME en el activate del venv).
