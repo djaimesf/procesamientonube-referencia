@@ -1,12 +1,20 @@
-"""Capa silver del pipeline de churn.
+"""Capa silver del pipeline de churn (bronze -> silver + cuarentena).
 
-Fase TDD "roja": solo se definen las firmas y las descripciones (docstrings).
-Todavia no hay implementacion; cada funcion levanta NotImplementedError.
+Lee cada CSV de bronze por separado, valida encabezados, resuelve
+duplicados, tipa las columnas numericas, convierte Churn a 1/0 (solo info churn)
+y agrega linaje. Lo ilegible va a cuarentena con su motivo.
+Punto de entrada: `procesar`. Probado con pytest (tests/test_*.py).
 """
 
 from __future__ import annotations
 
-from pyspark.sql import DataFrame, SparkSession
+import csv
+import json
+from collections import Counter
+
+from pyspark.sql import DataFrame, SparkSession, Window
+from pyspark.sql import functions as F
+from pyspark.sql.types import StringType, StructField, StructType
 
 
 def validar_encabezados(columnas: list[str], esperadas: list[str]) -> list[dict]:
@@ -34,7 +42,34 @@ def validar_encabezados(columnas: list[str], esperadas: list[str]) -> list[dict]
         - "detalle": texto legible que incluye el nombre de columna involucrado.
         Una lista vacia significa que el archivo esta OK.
     """
-    raise NotImplementedError("Paso 4: TDD verde")
+    errores: list[dict] = []
+
+    # normalizamos solo para comparar, sin tocar los nombres originales
+    normalizadas = [c.strip().lower() for c in columnas]
+    conteos = Counter(normalizadas)
+
+    # repetidos: uno por nombre, en orden de primera aparicion
+    ya_reportados: set[str] = set()
+    for original, norm in zip(columnas, normalizadas):
+        if conteos[norm] > 1 and norm not in ya_reportados:
+            ya_reportados.add(norm)
+            errores.append({
+                "regla": "encabezado_repetido",
+                "severidad": "bloquea",
+                "detalle": f"la columna '{original.strip()}' esta repetida en el encabezado",
+            })
+
+    # faltantes: en orden de `esperadas`
+    normalizadas_set = set(normalizadas)
+    for esperada in esperadas:
+        if esperada.strip().lower() not in normalizadas_set:
+            errores.append({
+                "regla": "columna_faltante",
+                "severidad": "bloquea",
+                "detalle": f"falta la columna esperada '{esperada}'",
+            })
+
+    return errores
 
 
 def leer_csv(spark: SparkSession, ruta: str, esperadas: list[str]) -> DataFrame:
@@ -50,7 +85,19 @@ def leer_csv(spark: SparkSession, ruta: str, esperadas: list[str]) -> DataFrame:
       y en ese orden, mas `_archivo_origen` al final (de `_metadata.file_path`).
     - Descarta las columnas que no esten en `esperadas`.
     """
-    raise NotImplementedError("Paso 4: TDD verde")
+    # sin esquema explicito: dejamos que Spark lea todo como texto
+    df = spark.read.csv(ruta, header=True, inferSchema=False)
+
+    # mapa normalizado -> nombre real, para emparejar por nombre y no posicion
+    normalizado_a_real = {c.strip().lower(): c for c in df.columns}
+
+    columnas_select = [
+        df[normalizado_a_real[esperada.strip().lower()]].alias(esperada)
+        for esperada in esperadas
+    ]
+    columnas_select.append(F.col("_metadata.file_path").alias("_archivo_origen"))
+
+    return df.select(*columnas_select)
 
 
 # Columnas que deben tiparse en silver: nombre -> tipo destino.
@@ -80,7 +127,22 @@ def a_cuarentena(df: DataFrame, regla: str, id_ejecucion: str) -> DataFrame:
       valor nulo, y con eso perderiamos la evidencia de que campo vino
       vacio y motivo el rechazo.
     """
-    raise NotImplementedError("Paso 4: TDD verde")
+    # columnas del registro original: todas menos las que empiezan por "_"
+    cols_registro = [c for c in df.columns if not c.startswith("_")]
+    registro_original = F.to_json(
+        F.struct(*cols_registro), {"ignoreNullFields": "false"}
+    )
+
+    return df.select(
+        F.current_timestamp().alias("fecha_error"),
+        F.lit("u3_silver").cast("string").alias("unidad_etapa"),
+        F.lit(regla).cast("string").alias("regla"),
+        F.lit("bloquea").cast("string").alias("severidad"),
+        F.col("_archivo_origen").alias("archivo_origen"),
+        F.col("customerID").alias("customerID"),
+        F.lit(id_ejecucion).cast("string").alias("id_ejecucion"),
+        registro_original.alias("registro_original"),
+    )
 
 
 def resolver_duplicados(df: DataFrame, id_ejecucion: str) -> tuple[DataFrame, DataFrame]:
@@ -107,7 +169,22 @@ def resolver_duplicados(df: DataFrame, id_ejecucion: str) -> tuple[DataFrame, Da
 
     `cuarentena` tiene el esquema de `a_cuarentena`.
     """
-    raise NotImplementedError("Paso 4: TDD verde")
+    # paso 1: filas identicas en TODO colapsan a una sola (determinista,
+    # porque todas las copias son iguales entre si)
+    sin_repetidas = df.dropDuplicates()
+
+    # paso 2: contamos filas por (archivo, customerID) con una ventana.
+    # nota: si customerID es nulo, los nulos del mismo archivo cuentan
+    # juntos (Spark trata nulo como un valor mas al particionar).
+    ventana = Window.partitionBy("_archivo_origen", "customerID")
+    con_conteo = sin_repetidas.withColumn("_n", F.count("*").over(ventana))
+
+    ok = con_conteo.filter(F.col("_n") == 1).drop("_n").select(*df.columns)
+    conflictivas = con_conteo.filter(F.col("_n") > 1).drop("_n").select(*df.columns)
+
+    cuarentena = a_cuarentena(conflictivas, "id_duplicado_conflictivo", id_ejecucion)
+
+    return ok, cuarentena
 
 
 def tipar(df: DataFrame, id_ejecucion: str) -> tuple[DataFrame, DataFrame]:
@@ -126,7 +203,42 @@ def tipar(df: DataFrame, id_ejecucion: str) -> tuple[DataFrame, DataFrame]:
     de COLUMNAS_NUMERICAS ya tipadas al tipo destino, el resto de columnas
     intacta como string. `cuarentena` tiene el esquema de `a_cuarentena`.
     """
-    raise NotImplementedError("Paso 4: TDD verde")
+    cols_num = [c for c in COLUMNAS_NUMERICAS if c in df.columns]
+
+    # bandera _ok_<col> por cada columna numerica: cast(...) es null tanto si
+    # el valor original ya era nulo como si no se pudo convertir (" ", "abc");
+    # el contrato trata ambos casos igual: la fila no pasa a ok.
+    con_flags = df
+    for col in cols_num:
+        tipo = COLUMNAS_NUMERICAS[col]
+        con_flags = con_flags.withColumn(f"_ok_{col}", F.col(col).cast(tipo).isNotNull())
+
+    valida = None
+    for col in cols_num:
+        bandera = F.col(f"_ok_{col}")
+        valida = bandera if valida is None else (valida & bandera)
+
+    select_ok = [
+        F.col(c).cast(COLUMNAS_NUMERICAS[c]).alias(c) if c in cols_num else F.col(c)
+        for c in df.columns
+    ]
+    ok = con_flags.filter(valida).select(*select_ok)
+
+    # una fila de cuarentena por cada columna que fallo, con el registro
+    # ORIGINAL en texto (no el valor tipado)
+    cuarentenas = [
+        a_cuarentena(
+            con_flags.filter(~F.col(f"_ok_{col}")).select(*df.columns),
+            f"no_numerico_{col.lower()}",
+            id_ejecucion,
+        )
+        for col in cols_num
+    ]
+    cuarentena = cuarentenas[0]
+    for extra in cuarentenas[1:]:
+        cuarentena = cuarentena.unionByName(extra)
+
+    return ok, cuarentena
 
 
 def churn_a_binario(df: DataFrame) -> DataFrame:
@@ -136,7 +248,12 @@ def churn_a_binario(df: DataFrame) -> DataFrame:
     "Yes"/"No" (ya filtrados por las etapas previas); el comportamiento
     ante otros valores es contrato de la Unidad 4 y no se prueba aqui.
     """
-    raise NotImplementedError("Paso 4: TDD verde")
+    # withColumn sobre "Churn" conserva su posicion; otros valores (fuera de
+    # Yes/No) quedan nulos, comportamiento de U4 no probado aqui
+    return df.withColumn(
+        "Churn",
+        F.when(F.col("Churn") == "Yes", 1).when(F.col("Churn") == "No", 0).cast("int"),
+    )
 
 
 # Columnas comunes a los dos archivos de origen (info churn, entrenamiento
@@ -184,7 +301,66 @@ def agregar_linaje(df: DataFrame, id_ejecucion: str) -> DataFrame:
 
     `_archivo_origen` y las demas columnas de `df` se conservan tal cual.
     """
-    raise NotImplementedError("Paso 4: TDD verde")
+    # current_timestamp() se evalua una sola vez al inicio de la consulta:
+    # todas las filas de esta llamada reciben el mismo valor
+    return df.withColumn("_fecha_ingesta", F.current_timestamp()).withColumn(
+        "_id_ejecucion", F.lit(id_ejecucion)
+    )
+
+
+def _leer_encabezados(spark: SparkSession, ruta: str) -> list[str]:
+    """Lee la primera linea del CSV con SPARK (funciona con rutas locales
+    y gs://) y la parsea con el modulo csv para respetar comillas.
+
+    No se usa spark.read.csv(..., header=True).columns: con encabezados
+    repetidos (p. ej. "tenure,TENURE") Spark les agrega sufijos propios
+    ("tenure0", "TENURE1") y perderiamos los nombres EXACTOS que exige
+    registro_original.
+    """
+    primera_linea = spark.read.text(ruta).first()[0]
+    encabezados = next(csv.reader([primera_linea]))
+    # quita el BOM si el archivo lo trae; solo afecta al primer nombre
+    if encabezados and encabezados[0].startswith("﻿"):
+        encabezados[0] = encabezados[0][1:]
+    return encabezados
+
+
+def _cuarentena_de_archivo(
+    spark: SparkSession,
+    ruta: str,
+    encabezados: list[str],
+    errores: list[dict],
+    id_ejecucion: str,
+) -> DataFrame:
+    """Arma las filas de cuarentena de un archivo rechazado por encabezados
+    invalidos (una fila por error), con el esquema de `a_cuarentena`."""
+    registro = json.dumps({"encabezados": encabezados}, ensure_ascii=False)
+    esquema = StructType(
+        [
+            StructField("unidad_etapa", StringType(), True),
+            StructField("regla", StringType(), True),
+            StructField("severidad", StringType(), True),
+            StructField("archivo_origen", StringType(), True),
+            StructField("customerID", StringType(), True),
+            StructField("id_ejecucion", StringType(), True),
+            StructField("registro_original", StringType(), True),
+        ]
+    )
+    filas = [
+        ("u3_silver", error["regla"], error["severidad"], ruta, None, id_ejecucion, registro)
+        for error in errores
+    ]
+    df = spark.createDataFrame(filas, schema=esquema)
+    return df.withColumn("fecha_error", F.current_timestamp()).select(
+        "fecha_error",
+        "unidad_etapa",
+        "regla",
+        "severidad",
+        "archivo_origen",
+        "customerID",
+        "id_ejecucion",
+        "registro_original",
+    )
 
 
 def procesar(
@@ -218,4 +394,41 @@ def procesar(
     - `cuarentena`: la union de la cuarentena de archivo (paso 2), la de
       `resolver_duplicados` y la de `tipar`.
     """
-    raise NotImplementedError("Paso 4: TDD verde")
+    dfs_validos = []
+    cuarentenas_archivo = []
+
+    for ruta in rutas:
+        encabezados = _leer_encabezados(spark, ruta)
+        errores = validar_encabezados(encabezados, esperadas)
+        if errores:
+            cuarentenas_archivo.append(
+                _cuarentena_de_archivo(spark, ruta, encabezados, errores, id_ejecucion)
+            )
+        else:
+            dfs_validos.append(leer_csv(spark, ruta, esperadas))
+
+    columnas_leidas = esperadas + ["_archivo_origen"]
+    if dfs_validos:
+        crudo = dfs_validos[0]
+        for df in dfs_validos[1:]:
+            crudo = crudo.unionByName(df)
+    else:
+        # ningun archivo valido: seguimos el mismo pipeline con un
+        # DataFrame vacio para no duplicar logica (silver queda vacio)
+        esquema_vacio = StructType(
+            [StructField(c, StringType(), True) for c in columnas_leidas]
+        )
+        crudo = spark.createDataFrame([], schema=esquema_vacio)
+
+    sin_dup, cuarentena_dup = resolver_duplicados(crudo, id_ejecucion)
+    tipado, cuarentena_tipo = tipar(sin_dup, id_ejecucion)
+    if "Churn" in esperadas:
+        tipado = churn_a_binario(tipado)
+    silver = agregar_linaje(tipado, id_ejecucion)
+
+    cuarentenas = cuarentenas_archivo + [cuarentena_dup, cuarentena_tipo]
+    cuarentena = cuarentenas[0]
+    for extra in cuarentenas[1:]:
+        cuarentena = cuarentena.unionByName(extra)
+
+    return silver, cuarentena
